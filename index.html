@@ -533,8 +533,8 @@ const cactusTemplates = [];
 const cactusFiles = [
   { url: "model/Cactus.glb",        hMin: 1.3, hMax: 2.2 },   // 키 큰 선인장
   { url: "model/Barrel cactus.glb", hMin: 0.8, hMax: 1.3 },   // 낮고 넓은 통선인장
-  { url: "model/Rock Large.glb",    hMin: 0.9, hMax: 1.5 },   // 큰 바위 (더 큼)
-  { url: "model/Rock.glb",          hMin: 0.7, hMax: 1.1 },   // 작은 바위 (더 큼)
+  { url: "model/Rock Large.glb",    hMin: 0.7, hMax: 1.2 },   // 큰 바위 (중간)
+  { url: "model/Rock.glb",          hMin: 0.55, hMax: 0.9 },  // 작은 바위 (중간)
 ];
 function prepCactusTemplate(node) {
   // 단위 높이(1)로 정규화 + 바닥을 y=0, 좌우 중심 맞춤
@@ -757,8 +757,8 @@ function animate() {
     if (spawnTimer <= 0) {
       obstacles.push(createCactus());
       const ramp = Math.min(4, score / 250);
-      const minDist = Math.max(7, 10 - ramp);
-      const maxDist = Math.max(12, 18 - ramp);
+      const minDist = Math.max(10, 13 - ramp);
+      const maxDist = Math.max(16, 22 - ramp);
       const distGap = minDist + Math.random() * (maxDist - minDist);
       spawnTimer = Math.round(distGap / speed);
     }
