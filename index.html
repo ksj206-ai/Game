@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>눈썹 점프 2D — DINO RUN</title>
+<style>
+  body {
+    margin: 0;
+    font-family: "Segoe UI", sans-serif;
+    background: linear-gradient(160deg, #2b1055, #7b2d6b 55%, #ff7e5f);
+    color: #fff;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 16px; min-height: 100vh; box-sizing: border-box;
+  }
+  h1 { margin: 8px 0; font-size: 26px; text-shadow: 2px 2px 0 #00000040; letter-spacing: 1px; }
+  #wrap { position: relative; width: 800px; max-width: 96vw; }
+  #video {
+    position: absolute; top: 8px; right: 8px; width: 180px;
+    border: 2px solid #ffd56b; border-radius: 8px;
+    transform: scaleX(-1); z-index: 2;
+  }
+  #game { width: 100%; background: #2b1055; border-radius: 12px; display: block; box-shadow: 0 10px 30px #00000060; }
+  #status { margin-top: 10px; font-size: 14px; color: #ffe; text-align: center; min-height: 20px; }
+  .bar-wrap { width: 800px; max-width: 96vw; height: 14px; background: #0004; border-radius: 7px; margin-top: 8px; overflow: hidden; }
+  .bar { height: 100%; width: 0%; background: #4cc9f0; transition: width .05s; }
+  button {
+    margin-top: 12px; padding: 8px 18px; font-size: 15px;
+    background: #ffd56b; color: #5a2a66; border: none; border-radius: 8px;
+    cursor: pointer; font-weight: bold;
+  }
+</style>
+</head>
+<body>
+  <h1>🦖 눈썹 점프 2D — DINO RUN</h1>
+  <div id="wrap">
+    <canvas id="game" width="800" height="450"></canvas>
+    <video id="video" autoplay muted playsinline></video>
+  </div>
+  <div class="bar-wrap"><div id="bar" class="bar"></div></div>
+  <div id="status">카메라를 준비하는 중...</div>
+  <button id="resetBtn">다시 시작 (R)</button>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script>
+const video  = document.getElementById("video");
+const canvas = document.getElementById("game");
+const ctx    = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const barEl  = document.getElementById("bar");
+
+// ── 게임 상태 ─────────────────────────────────────────────
+const W = canvas.width, H = canvas.height;
+const GROUND = H - 50;            // 캐릭터 중심 기준 바닥 높이
+let player, obstacles, score, gameOver, speed, lastMilestone, paused;
+let particles = [], shake = 0, flash = 0;   // juice: 파티클 / 화면흔들림 / 빨간플래시
+let spawnTimer = 0;                          // 다음 선인장까지 남은 프레임
+
+function reset() {
+  player = { x: 80, y: GROUND, vy: 0, size: 36, onGround: true, squash: 0 };
+  obstacles = [];
+  particles = [];
+  score = 0;
+  speed = 4;
+  gameOver = false;
+  lastMilestone = 0;
+  paused = false;
+  shake = 0;
+  flash = 0;
+  spawnTimer = 90;   // 시작 후 첫 선인장까지 약간의 여유
+}
+reset();
+
+const GRAVITY = 0.8;
+const JUMP_POWER = -14;
+
+// ── 효과음 (Web Audio로 즉석 생성, 외부 파일 없음) ──────────
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) audioCtx = new AC(); }
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+}
+function beep(freq, dur, type, vol, slideTo) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+  osc.type = type; osc.frequency.setValueAtTime(freq, t);
+  if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+  gain.gain.setValueAtTime(vol, t);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.start(t); osc.stop(t + dur);
+}
+const sfxJump  = () => beep(320, 0.18, "square",   0.18, 760);
+const sfxHit   = () => beep(220, 0.45, "sawtooth", 0.25, 60);
+const sfxScore = () => beep(880, 0.08, "square",   0.12);
+window.addEventListener("pointerdown", initAudio, { once: true });
+window.addEventListener("keydown", initAudio, { once: true });
+
+function jump() {
+  if (player.onGround && !gameOver && !paused) {
+    player.vy = JUMP_POWER;
+    player.onGround = false;
+    sfxJump();
+  }
+}
+
+// ── 눈썹 감지 + 보정 ──────────────────────────────────────
+const L_BROW = 105, L_EYE = 159, R_BROW = 334, R_EYE = 386;
+const FACE_TOP = 10, FACE_BOTTOM = 152;
+
+let smooth = null, wasRaised = false, debugInfo = "";
+let phase = "neutral";            // neutral → raised → play
+let phaseTimer = 0;
+const PREP = 75, SAMPLE = 60;
+let neutralSamples = [], raisedSamples = [];
+let neutralVal = 0, raisedVal = 0, threshold = 0;
+let calibTitle = "", calibSub = "", calibProgress = 0;
+const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+
+function startCalibration() { phase = "neutral"; phaseTimer = 0; neutralSamples = []; raisedSamples = []; }
+
+function onFaceResults(results) {
+  if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+    statusEl.textContent = "얼굴이 안 보여요. 카메라 정면을 봐주세요.";
+    return;
+  }
+  const lm = results.multiFaceLandmarks[0];
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const faceHeight = dist(lm[FACE_TOP], lm[FACE_BOTTOM]);
+  const browEye = (dist(lm[L_BROW], lm[L_EYE]) + dist(lm[R_BROW], lm[R_EYE])) / 2;
+  const rawValue = browEye / faceHeight;
+  smooth = (smooth === null) ? rawValue : smooth * 0.5 + rawValue * 0.5;
+
+  if (phase === "neutral") {
+    phaseTimer++;
+    calibTitle = "① 평상시 표정을 지어주세요";
+    if (phaseTimer <= PREP) { calibSub = "잠시 후 측정합니다... " + Math.ceil((PREP - phaseTimer) / 30); calibProgress = 0; }
+    else { neutralSamples.push(smooth); calibSub = "측정 중... 가만히 계세요"; calibProgress = (phaseTimer - PREP) / SAMPLE; }
+    if (phaseTimer > PREP + SAMPLE) { neutralVal = avg(neutralSamples); phase = "raised"; phaseTimer = 0; }
+    statusEl.textContent = "보정 1/2 — 평상시 표정";
+
+  } else if (phase === "raised") {
+    phaseTimer++;
+    calibTitle = "② 눈썹을 위로 올려주세요 🤨";
+    if (phaseTimer <= PREP) { calibSub = "눈썹을 올린 채 기다리세요... " + Math.ceil((PREP - phaseTimer) / 30); calibProgress = 0; }
+    else { raisedSamples.push(smooth); calibSub = "측정 중... 눈썹 올린 상태 유지!"; calibProgress = (phaseTimer - PREP) / SAMPLE; }
+    if (phaseTimer > PREP + SAMPLE) {
+      raisedVal = avg(raisedSamples);
+      if (raisedVal <= neutralVal + 0.003) raisedVal = neutralVal + 0.03;
+      threshold = neutralVal + (raisedVal - neutralVal) * 0.4;
+      phase = "play"; phaseTimer = 0;
+    }
+    statusEl.textContent = "보정 2/2 — 눈썹 올린 표정";
+
+  } else {
+    const isRaised = smooth > threshold;
+    if (isRaised && !wasRaised) jump();
+    wasRaised = isRaised;
+    const pct = (smooth - neutralVal) / (raisedVal - neutralVal) * 100;
+    barEl.style.width = Math.min(100, Math.max(0, pct)) + "%";
+    barEl.style.background = isRaised ? "#f72585" : "#4cc9f0";
+    statusEl.textContent = isRaised ? "🤨 눈썹 올림 → 점프!" : "눈썹을 올려서 점프 ( P=일시정지, C=재보정 )";
+    debugInfo = `now ${smooth.toFixed(3)}  기준 ${threshold.toFixed(3)}  평상 ${neutralVal.toFixed(3)}  올림 ${raisedVal.toFixed(3)}`;
+  }
+}
+
+// ── 그래픽 (플래시 게임 스타일: 석양 사막 + 공룡) ──────────
+const GROUND_TOP = GROUND + 18;   // 캐릭터가 서는 땅 높이
+let bgScroll = 0, groundScroll = 0, runPhase = 0;
+
+// ── 파티클 시스템 (먼지 / 폭발) ──────────────────────────
+function spawnParticle(x, y, vx, vy, life, size, color, gravity) {
+  particles.push({ x, y, vx, vy, life, maxLife: life, size, color, gravity });
+}
+function spawnDust(x, y) {
+  for (let i = 0; i < 3; i++) {
+    spawnParticle(x + (Math.random() - 0.5) * 8, y,
+      -speed * (0.4 + Math.random() * 0.5), -Math.random() * 1.4,
+      18 + Math.random() * 10, 2 + Math.random() * 2.5, "rgba(224,168,104,", 0.04);
+  }
+}
+function spawnLandDust(x, y) {
+  for (let i = 0; i < 10; i++) {
+    const a = Math.PI + (Math.random() - 0.5) * 1.6;
+    const sp = 1 + Math.random() * 2.5;
+    spawnParticle(x, y, Math.cos(a) * sp * (Math.random() < 0.5 ? 1 : -1.2), -Math.random() * 1.5,
+      20 + Math.random() * 12, 2 + Math.random() * 3, "rgba(224,168,104,", 0.05);
+  }
+}
+function spawnExplosion(x, y) {
+  const cols = ["rgba(255,107,107,", "rgba(255,213,107,", "rgba(255,160,60,", "rgba(255,255,255,"];
+  for (let i = 0; i < 34; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 2 + Math.random() * 6;
+    spawnParticle(x, y, Math.cos(a) * sp, Math.sin(a) * sp - 2,
+      26 + Math.random() * 22, 2 + Math.random() * 4,
+      cols[(Math.random() * cols.length) | 0], 0.12);
+  }
+}
+function updateParticles() {
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.vy += p.gravity; p.life--;
+  }
+  particles = particles.filter(p => p.life > 0);
+}
+function drawParticles() {
+  for (const p of particles) {
+    const a = Math.max(0, p.life / p.maxLife);
+    ctx.fillStyle = p.color + a.toFixed(2) + ")";
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, 7);
+    ctx.fill();
+  }
+}
+
+// ── 배경 장식 데이터 (별 / 새, 한 번만 생성) ──────────────
+const stars = [];
+for (let i = 0; i < 70; i++) {
+  stars.push({ x: Math.random() * W, y: Math.random() * (GROUND_TOP * 0.65),
+    r: Math.random() * 1.4 + 0.5, ph: Math.random() * 7, sp: 0.5 + Math.random() });
+}
+const birds = [];
+for (let i = 0; i < 4; i++) {
+  birds.push({ x: Math.random() * W, y: 40 + Math.random() * 130,
+    sp: 0.25 + Math.random() * 0.5, flap: Math.random() * 7, scale: 0.7 + Math.random() * 0.6 });
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBird(x, y, s, flap) {
+  const wing = Math.sin(flap) * 5;
+  ctx.strokeStyle = "rgba(40,15,55,0.6)";
+  ctx.lineWidth = 2 * s;
+  ctx.beginPath();
+  ctx.moveTo(x - 8 * s, y + wing);
+  ctx.quadraticCurveTo(x, y - 4 * s, x, y);
+  ctx.quadraticCurveTo(x, y - 4 * s, x + 8 * s, y + wing);
+  ctx.stroke();
+}
+
+function drawBackground() {
+  // 밤하늘 → 석양 그라데이션
+  const sky = ctx.createLinearGradient(0, 0, 0, GROUND_TOP);
+  sky.addColorStop(0, "#150a35");
+  sky.addColorStop(0.35, "#2b1055");
+  sky.addColorStop(0.7, "#7b2d6b");
+  sky.addColorStop(1, "#ff7e5f");
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, GROUND_TOP);
+
+  // 레이어 0: 반짝이는 별 (가장 느림)
+  for (const st of stars) {
+    const tw = 0.4 + 0.6 * Math.abs(Math.sin(frame * 0.04 * st.sp + st.ph));
+    const sx = (st.x - bgScroll * 0.04) % W;
+    const x = (sx + W) % W;
+    ctx.fillStyle = `rgba(255,255,255,${tw.toFixed(2)})`;
+    ctx.beginPath();
+    ctx.arc(x, st.y, st.r, 0, 7);
+    ctx.fill();
+  }
+
+  // 달 + 은은한 빛무리
+  const mx = W * 0.74, my = GROUND_TOP - 78;
+  const glow = ctx.createRadialGradient(mx, my, 8, mx, my, 70);
+  glow.addColorStop(0, "rgba(255,243,200,0.45)");
+  glow.addColorStop(1, "rgba(255,243,200,0)");
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(mx, my, 70, 0, 7); ctx.fill();
+  ctx.fillStyle = "#fdf2c4";
+  ctx.beginPath(); ctx.arc(mx, my, 38, 0, 7); ctx.fill();
+  ctx.fillStyle = "rgba(220,200,150,0.45)";   // 크레이터
+  ctx.beginPath(); ctx.arc(mx - 12, my - 8, 6, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(mx + 10, my + 6, 9, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(mx + 6, my - 14, 4, 0, 7); ctx.fill();
+
+  // 레이어 1: 먼 산 (느림, 어두움)
+  ctx.fillStyle = "#3a1c52";
+  const off1 = (bgScroll * 0.12) % 400;
+  for (let i = -1; i < 4; i++) {
+    const bx = i * 400 - off1;
+    ctx.beginPath();
+    ctx.moveTo(bx, GROUND_TOP);
+    ctx.lineTo(bx + 200, GROUND_TOP - 150);
+    ctx.lineTo(bx + 400, GROUND_TOP);
+    ctx.fill();
+  }
+
+  // 레이어 2: 중간 언덕 (중간 속도)
+  ctx.fillStyle = "#5a2a66";
+  const off2 = (bgScroll * 0.3) % 260;
+  for (let i = -1; i < 5; i++) {
+    const bx = i * 260 - off2;
+    ctx.beginPath();
+    ctx.moveTo(bx, GROUND_TOP);
+    ctx.quadraticCurveTo(bx + 130, GROUND_TOP - 90, bx + 260, GROUND_TOP);
+    ctx.fill();
+  }
+
+  // 레이어 3: 가까운 언덕 (빠름, 밝음)
+  ctx.fillStyle = "#7a3a5a";
+  const off3 = (bgScroll * 0.55) % 200;
+  for (let i = -1; i < 6; i++) {
+    const bx = i * 200 - off3;
+    ctx.beginPath();
+    ctx.moveTo(bx, GROUND_TOP);
+    ctx.quadraticCurveTo(bx + 100, GROUND_TOP - 48, bx + 200, GROUND_TOP);
+    ctx.fill();
+  }
+
+  // 날아가는 새 (장식)
+  for (const b of birds) {
+    b.x -= b.sp; b.flap += 0.25;
+    if (b.x < -20) { b.x = W + 20; b.y = 40 + Math.random() * 130; }
+    drawBird(b.x, b.y, b.scale, b.flap);
+  }
+
+  // 구름
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  const co = (bgScroll * 0.18) % (W + 200);
+  for (const c of [[120, 70], [380, 110], [600, 55]]) {
+    const cx = (c[0] - co + W + 200) % (W + 200) - 100;
+    ctx.beginPath();
+    ctx.arc(cx, c[1], 16, 0, 7);
+    ctx.arc(cx + 20, c[1] + 4, 20, 0, 7);
+    ctx.arc(cx + 44, c[1], 15, 0, 7);
+    ctx.fill();
+  }
+}
+
+function drawGround() {
+  ctx.fillStyle = "#e0a868";
+  ctx.fillRect(0, GROUND_TOP, W, H - GROUND_TOP);
+  ctx.fillStyle = "#c98a4a";
+  ctx.fillRect(0, GROUND_TOP, W, 6);
+  ctx.fillStyle = "#a86b34";
+  const go = groundScroll % 40;
+  for (let x = -40; x < W + 40; x += 40) {
+    ctx.fillRect(x - go, GROUND_TOP + 16, 14, 4);
+    ctx.fillRect(x - go + 22, GROUND_TOP + 30, 9, 4);
+  }
+}
+
+// 여우 캐릭터 (cx: 중심X, feetY: 발 높이, run: 0~1 달리기 위상, air: 점프중, sx/sy: 찌그러짐)
+function drawFox(cx, feetY, run, air, sx, sy) {
+  const orange = "#ef8a3c", dark = "#3a2a22", white = "#fbeede", ear = "#b9501f";
+  ctx.save();
+  ctx.translate(cx, feetY);
+  ctx.scale(sx, sy);   // 발끝 기준 squash & stretch
+
+  // 풍성한 꼬리 (왼쪽으로)
+  ctx.fillStyle = orange;
+  ctx.beginPath();
+  ctx.moveTo(-12, -30);
+  ctx.quadraticCurveTo(-42, -36, -36, -8);
+  ctx.quadraticCurveTo(-26, -18, -12, -20);
+  ctx.closePath(); ctx.fill();
+  // 꼬리 흰 끝
+  ctx.fillStyle = white;
+  ctx.beginPath();
+  ctx.moveTo(-36, -8);
+  ctx.quadraticCurveTo(-31, -16, -23, -16);
+  ctx.quadraticCurveTo(-30, -6, -36, -8);
+  ctx.closePath(); ctx.fill();
+
+  // 다리 (달릴 때 번갈아, 점프 중엔 모음)
+  ctx.fillStyle = dark;
+  const swing = air ? 0 : Math.sin(run * Math.PI * 2) * 5;
+  ctx.fillRect(-9, -12, 6, 12 + swing);
+  ctx.fillRect(4, -12, 6, 12 - swing);
+
+  // 몸통
+  ctx.fillStyle = orange;
+  roundRect(-15, -34, 27, 26, 9); ctx.fill();
+  // 흰 가슴/배
+  ctx.fillStyle = white;
+  roundRect(-2, -22, 14, 14, 6); ctx.fill();
+
+  // 머리
+  ctx.fillStyle = orange;
+  roundRect(2, -48, 20, 18, 7); ctx.fill();
+
+  // 귀 (바깥 주황 + 안쪽 어두운색)
+  ctx.fillStyle = orange;
+  ctx.beginPath(); ctx.moveTo(3, -45); ctx.lineTo(1, -61); ctx.lineTo(13, -49); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(14, -48); ctx.lineTo(21, -61); ctx.lineTo(24, -45); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = ear;
+  ctx.beginPath(); ctx.moveTo(5, -47); ctx.lineTo(4, -56); ctx.lineTo(11, -49); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(16, -48); ctx.lineTo(20, -56); ctx.lineTo(22, -46); ctx.closePath(); ctx.fill();
+
+  // 흰 주둥이 + 코
+  ctx.fillStyle = white;
+  roundRect(15, -40, 15, 10, 4); ctx.fill();
+  ctx.fillStyle = dark;
+  ctx.beginPath(); ctx.arc(30, -35, 2.6, 0, 7); ctx.fill();
+
+  // 눈
+  ctx.beginPath(); ctx.arc(13, -41, 2.3, 0, 7); ctx.fill();
+
+  ctx.restore();
+}
+
+function drawCactus(x, w, h) {
+  const top = GROUND_TOP - h;
+  ctx.fillStyle = "#3f8f4f";
+  ctx.strokeStyle = "#2c6b39";
+  ctx.lineWidth = 2;
+  roundRect(x, top, w, h, 5); ctx.fill(); ctx.stroke();
+  const armY = top + h * 0.4;
+  roundRect(x - 7, armY, 7, h * 0.32, 3); ctx.fill(); ctx.stroke();
+  roundRect(x - 7, armY, 7, 7, 3); ctx.fill();
+  roundRect(x + w, armY + 6, 7, h * 0.3, 3); ctx.fill(); ctx.stroke();
+  roundRect(x + w, armY + 6, 7, 7, 3); ctx.fill();
+}
+
+// ── 게임 루프 ─────────────────────────────────────────────
+let frame = 0;
+function gameLoop() {
+  frame++;
+  ctx.clearRect(0, 0, W, H);
+
+  // 보정 중에는 게임을 멈추고 안내 화면
+  if (phase !== "play") {
+    drawBackground();
+    drawGround();
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillText(calibTitle, W/2, H/2 - 30);
+    ctx.font = "16px sans-serif";
+    ctx.fillStyle = "#9ad";
+    ctx.fillText(calibSub, W/2, H/2 + 6);
+    const bw = 300, bx = W/2 - bw/2, by = H/2 + 30;
+    ctx.fillStyle = "#333"; ctx.fillRect(bx, by, bw, 12);
+    ctx.fillStyle = "#4cc9f0"; ctx.fillRect(bx, by, bw * Math.min(1, calibProgress), 12);
+    ctx.font = "13px sans-serif";
+    ctx.fillStyle = "#cab";
+    ctx.fillText("카메라가 안 잡히면 Enter 키로 키보드(Space) 모드 시작", W/2, H/2 + 70);
+    ctx.textAlign = "left";
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
+  if (!gameOver && !paused) {
+    const wasAir = !player.onGround;
+    player.vy += GRAVITY;
+    player.y += player.vy;
+    if (player.y >= GROUND) {
+      player.y = GROUND; player.vy = 0;
+      if (wasAir) { player.squash = 1; spawnLandDust(player.x - 4, GROUND_TOP); } // 착지 임팩트
+      player.onGround = true;
+    }
+    if (player.squash > 0) player.squash = Math.max(0, player.squash - 0.14);
+
+    // 달리는 중 먼지
+    if (player.onGround && frame % 5 === 0) spawnDust(player.x - 8, GROUND_TOP);
+
+    // 선인장 생성: 속도에 맞춘 "픽셀 거리" 기준 랜덤 간격 → 어떤 속도에서도 점프로 넘을 수 있게 보장
+    spawnTimer--;
+    if (spawnTimer <= 0) {
+      const h = 28 + Math.random() * 34;          // 높이 28~62 (점프 정점 ~120px라 충분히 넘음)
+      const w = 20 + Math.random() * 14;          // 폭 20~34
+      obstacles.push({ x: W, w, h });
+      // 점수가 오를수록 간격이 조금씩 좁아지지만, 최소 거리는 항상 확보
+      const ramp = Math.min(110, score / 8);
+      const minDist = Math.max(210, 300 - ramp);  // 선인장 사이 최소 픽셀 간격
+      const maxDist = Math.max(330, 560 - ramp);
+      const dist = minDist + Math.random() * (maxDist - minDist);
+      spawnTimer = Math.round(dist / speed);       // 거리 ÷ 속도 = 프레임 수
+    }
+    for (const o of obstacles) {
+      o.x -= speed;
+      const px = player.x, py = player.y;
+      const hit = px + player.size/2 > o.x && px - player.size/2 < o.x + o.w
+               && py + player.size/2 > GROUND + player.size/2 - o.h;
+      if (hit && !gameOver) {
+        gameOver = true; sfxHit();
+        shake = 22; flash = 0.85;                 // 화면 흔들림 + 빨간 플래시
+        spawnExplosion(player.x, player.y);       // 폭발 파티클
+      }
+    }
+    obstacles = obstacles.filter(o => o.x + o.w > 0);
+    score++;
+    speed = 4 + score / 600;
+
+    bgScroll += speed;
+    groundScroll += speed;
+    runPhase = (runPhase + speed * 0.03) % 1;
+
+    if (Math.floor(score / 100) > lastMilestone) { lastMilestone = Math.floor(score / 100); sfxScore(); }
+  }
+
+  if (!paused) updateParticles();   // 게임오버 후에도 폭발은 계속 퍼지도록
+
+  // ── 월드 그리기 (화면 흔들림 적용) ──
+  ctx.save();
+  if (shake > 0) {
+    const m = shake * 0.7;
+    ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+    shake--;
+  }
+  drawBackground();
+  drawGround();
+  for (const o of obstacles) drawCactus(o.x, o.w, o.h);
+
+  // 점프/착지 찌그러짐 계산
+  let fsx = 1, fsy = 1;
+  if (player.squash > 0) {
+    fsy = 1 - player.squash * 0.32;
+    fsx = 1 + player.squash * 0.32;
+  } else if (!player.onGround) {
+    const st = Math.max(-1, Math.min(1, -player.vy / 14));
+    fsy = 1 + st * 0.16;
+    fsx = 1 / fsy;
+  }
+  drawFox(player.x, player.y + player.size/2, runPhase, !player.onGround, fsx, fsy);
+  drawParticles();
+  ctx.restore();
+
+  // 빨간 충돌 플래시
+  if (flash > 0) {
+    ctx.fillStyle = `rgba(255,70,70,${flash.toFixed(2)})`;
+    ctx.fillRect(0, 0, W, H);
+    flash = Math.max(0, flash - 0.06);
+  }
+
+  ctx.fillStyle = "rgba(0,0,0,0.35)";
+  roundRect(12, 12, 150, 30, 8); ctx.fill();
+  ctx.fillStyle = "#ffd56b";
+  ctx.font = "bold 20px 'Segoe UI', sans-serif";
+  ctx.fillText("⭐ " + Math.floor(score / 10), 24, 34);
+  ctx.fillStyle = "#bbb";
+  ctx.font = "12px monospace";
+  ctx.fillText(debugInfo, 14, 58);
+
+  if (paused && !gameOver) {
+    ctx.fillStyle = "rgba(20,5,30,0.6)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 38px 'Segoe UI', sans-serif";
+    ctx.fillText("⏸ 일시정지", W/2, H/2 - 6);
+    ctx.fillStyle = "#ffd56b";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("P 키를 눌러 계속하기", W/2, H/2 + 28);
+    ctx.textAlign = "left";
+  }
+
+  if (gameOver) {
+    ctx.fillStyle = "rgba(20,5,30,0.7)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ff6b6b";
+    ctx.font = "bold 40px 'Segoe UI', sans-serif";
+    ctx.fillText("💥 GAME OVER", W/2, H/2 - 16);
+    ctx.fillStyle = "#ffd56b";
+    ctx.font = "bold 22px 'Segoe UI', sans-serif";
+    ctx.fillText("점수 " + Math.floor(score / 10), W/2, H/2 + 18);
+    ctx.fillStyle = "#fff";
+    ctx.font = "16px sans-serif";
+    ctx.fillText("R 키 또는 버튼으로 다시 시작", W/2, H/2 + 48);
+    ctx.textAlign = "left";
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Space") { e.preventDefault(); jump(); }
+  if (e.code === "KeyR") reset();
+  if (e.code === "KeyC") startCalibration();
+  // Enter: 카메라 없이 키보드(Space)로 바로 시작 (보정 건너뛰기)
+  if (e.code === "Enter" && phase !== "play") {
+    neutralVal = 0; raisedVal = 1; threshold = 2;   // 눈썹 트리거 비활성화 (Space만)
+    phase = "play"; reset();
+  }
+  // P 또는 Esc = 게임 중 일시정지 / 해제
+  if ((e.code === "KeyP" || e.code === "Escape") && phase === "play" && !gameOver) {
+    paused = !paused;
+  }
+});
+document.getElementById("resetBtn").onclick = reset;
+
+// 게임 렌더링은 카메라/MediaPipe와 독립적으로 항상 시작 (새로고침 시 초기화 실패해도 화면은 뜨도록)
+gameLoop();
+
+// ── MediaPipe 초기화 (실패해도 게임은 계속 동작) ──────────────
+function initFaceTracking() {
+  if (typeof FaceMesh === "undefined" || typeof Camera === "undefined") {
+    statusEl.textContent = "⚠ 얼굴인식 라이브러리 로드 실패 (인터넷 확인). Space 키로 점프 가능.";
+    return;
+  }
+  try {
+    const faceMesh = new FaceMesh({
+      locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`
+    });
+    faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    faceMesh.onResults(onFaceResults);
+
+    const camera = new Camera(video, {
+      onFrame: async () => { await faceMesh.send({ image: video }); },
+      width: 640, height: 480,
+    });
+    camera.start()
+      .then(() => { statusEl.textContent = "보정을 시작합니다. 화면 안내를 따라주세요."; })
+      .catch((err) => { statusEl.textContent = "카메라 접근 실패: " + err.message + " (Space 키로 점프 가능)"; });
+  } catch (err) {
+    statusEl.textContent = "얼굴인식 초기화 오류: " + err.message + " (Space 키로 점프 가능)";
+  }
+}
+
+// CDN 스크립트가 아직 로드 중일 수 있으니 window load 이후 시작
+if (document.readyState === "complete") initFaceTracking();
+else window.addEventListener("load", initFaceTracking);
+</script>
+</body>
+</html>

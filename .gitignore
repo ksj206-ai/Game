@@ -1,0 +1,11 @@
+# 배포 저장소에는 2D 게임(index.html)만 포함
+eyebrow-jump.html
+eyebrow-jump-2d.html
+eyebrow-jump-3d.html
+
+# 기타
+node_modules/
+.DS_Store
+.vercel
+__*.js
+__*.mjs
